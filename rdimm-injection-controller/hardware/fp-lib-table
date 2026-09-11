@@ -1,0 +1,5 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "Teensy")(type "KiCad")(uri "/home/stefan/Documents/Arbeit/Gloor-Elektronik/Projekte/0005_RDIMM_Interposer/injection-controller/hardware")(options "")(descr ""))
+  (lib (name "DDR5")(type "KiCad")(uri "/home/stefan/Documents/Arbeit/Gloor-Elektronik/Projekte/0005_RDIMM_Interposer/rdimm-interposer/hardware/ddr5.pretty")(options "")(descr ""))
+)

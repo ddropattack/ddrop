@@ -1,0 +1,3 @@
+[submodule "badram"]
+	path = badram
+	url = https://github.com/badramattack/badram

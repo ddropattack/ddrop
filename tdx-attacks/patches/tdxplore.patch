@@ -1,0 +1,672 @@
+diff --git a/pocs/cpus/tdxplore/kmod/config.h b/pocs/cpus/tdxplore/kmod/config.h
+index 02c73b4..bafe0e4 100644
+--- a/pocs/cpus/tdxplore/kmod/config.h
++++ b/pocs/cpus/tdxplore/kmod/config.h
+@@ -2,14 +2,14 @@
+ #define __GATEWAY_CONFIG_H__
+ 
+ #define USE_VM_FLAGS_API
+-// #define ENABLE_UNEXPORTED_SYMBOLS
++#define ENABLE_UNEXPORTED_SYMBOLS
+ // #define ENABLE_ISSUE_VMX
+ 
+ // #define ENABLE_ISSUE_MRS_MSR
+ //#define ENABLE_ISSUE_SMC
+ #define ENABLE_ALLOC_FREE_CONTIGUOUS_BUFFER
+ // #define ENABLE_ISSUE_PORTIO
+-// #define ENABLE_ISSUE_SEAMCALL_TDCALL
++#define ENABLE_ISSUE_SEAMCALL_TDCALL
+ // #define ENABLE_ISSUE_RDMSR_WRMSR
+ 
+ // #define ENABLE_ISSUE_SPECTRE
+diff --git a/pocs/cpus/tdxplore/kmod/driver.c b/pocs/cpus/tdxplore/kmod/driver.c
+index ad8c438..54e3b7a 100644
+--- a/pocs/cpus/tdxplore/kmod/driver.c
++++ b/pocs/cpus/tdxplore/kmod/driver.c
+@@ -77,13 +77,18 @@
+ 
+ #define GATEWAY_IOCTL_IPI_STORM _IOWR(GATEWAY_IOC_MAGIC, 32, void*)
+ 
++#define GATEWAY_IOCTL_REQ_OUTSIDE_GUEST_MODE _IOWR(GATEWAY_IOC_MAGIC, 33, void*)
++
++#define GATEWAY_IOCTL_GET_TDR_PA _IOWR(GATEWAY_IOC_MAGIC, 34, void *)
++#define GATEWAY_IOCTL_GET_TDCS_PA _IOWR(GATEWAY_IOC_MAGIC, 35, void *)
++
+ #define GATEWAY_BUFFER_SIZE 0x1000
+ #define GATEWAY_BLOCK_SIZE 0x200
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Kirk Swidowski (swidowski@google.com)");
+ MODULE_DESCRIPTION("Gateway");
+-MODULE_VERSION("0.01");
++MODULE_VERSION("0.01.1");
+ 
+ typedef struct {
+   unsigned char* _data;
+@@ -219,6 +224,17 @@ static long int gateway_ioctl(struct file* file, unsigned int cmd,
+     case GATEWAY_IOCTL_IPI_STORM:
+       printk(KERN_INFO "IPI STORM\n");
+       return ioctl_ipi_storm(p);
++    
++    case GATEWAY_IOCTL_REQ_OUTSIDE_GUEST_MODE:
++      printk(KERN_INFO "KVM_REQ_OUTSIDE_GUEST_MODE\n");
++      return ioctl_req_outside_guest_mode(p);
++
++    case GATEWAY_IOCTL_GET_TDR_PA:
++      printk(KERN_INFO "Querying TDR PA\n");
++      return ioctl_get_tdr_pa(p);
++    case GATEWAY_IOCTL_GET_TDCS_PA:
++      printk(KERN_INFO "Querying TDCS PA\n");
++      return ioctl_get_tdcs_pa(p);
+   }
+ 
+   return 0;
+@@ -392,6 +408,26 @@ static int resolve_unexported_symbols(void) {
+   printk(KERN_INFO "task_lookup_fdget_rcu found at %lx\n",
+          (unsigned long)_task_lookup_fdget_rcu);
+ 
++  _kvm_make_all_cpus_request =
++      (kvm_make_all_cpus_request_t)_kallsyms_lookup_name(
++          "kvm_make_all_cpus_request");
++  if (!_kvm_make_all_cpus_request) {
++    printk(KERN_ERR "kvm_make_all_cpus_request not found.\n");
++    return -ENOENT;
++  }
++  printk(KERN_INFO "kvm_make_all_cpus_request found at %lx\n",
++         (unsigned long)_kvm_make_all_cpus_request);
++
++  _vm_list =
++      (void*)_kallsyms_lookup_name(
++          "vm_list");
++  if (!_vm_list) {
++    printk(KERN_ERR "vm_list not found.\n");
++    return -ENOENT;
++  }
++  printk(KERN_INFO "vm_list found at %lx\n",
++         (unsigned long)_vm_list);
++
+   return 0;
+ }
+ #endif  // ENABLE_UNEXPORTED_SYMBOLS
+@@ -421,4 +457,4 @@ static void __exit gateway_exit(void) {
+ }
+ 
+ module_init(gateway_init);
+-module_exit(gateway_exit);
+\ No newline at end of file
++module_exit(gateway_exit);
+diff --git a/pocs/cpus/tdxplore/kmod/ioctl.c b/pocs/cpus/tdxplore/kmod/ioctl.c
+index a74c2c2..3c39067 100644
+--- a/pocs/cpus/tdxplore/kmod/ioctl.c
++++ b/pocs/cpus/tdxplore/kmod/ioctl.c
+@@ -26,6 +26,46 @@
+ typedef uint64_t virt_addr_t;
+ typedef uint64_t kern_addr_t;
+ 
++
++
++
++struct kvm_tdx {
++	struct kvm kvm;
++	struct misc_cg *misc_cg;
++
++	unsigned long tdr_pa;
++	unsigned long *tdcs_pa;
++
++	u64 attributes;
++	u64 xfam;
++	int hkid;
++
++	/*
++	 * Used on each TD-exit, see tdx_user_return_update_cache().
++	 * TSX_CTRL value on TD exit
++	 * - set 0     if guest TSX enabled
++	 * - preserved if guest TSX disabled
++	 */
++	bool tsx_supported;
++
++	bool finalized;
++	atomic_t tdh_mem_track;
++
++	u64 tsc_offset;
++
++	/*
++	 * For KVM_SET_CPUID to check consistency. Remember the one passed to
++	 * TDH.MNG_INIT
++	 */
++	int cpuid_nent;
++	struct kvm_cpuid_entry2 *cpuid;
++
++	/* For KVM_MEMORY_MAPPING */
++	struct mutex source_lock;
++	struct page *source_page;
++};
++
++
+ typedef struct {
+   kern_addr_t ka;
+   size_t size;
+@@ -437,6 +477,8 @@ typedef struct {
+ find_task_by_vpid_function_t _find_task_by_vpid = NULL;
+ task_lookup_fdget_rcu_function_t _task_lookup_fdget_rcu = NULL;
+ kallsyms_lookup_name_function_t _kallsyms_lookup_name = NULL;
++struct list_head* _vm_list = NULL;
++kvm_make_all_cpus_request_t _kvm_make_all_cpus_request = NULL;
+ 
+ int ioctl_fdget(void __user *p) {
+   struct task_struct *t;
+@@ -755,4 +797,142 @@ int ioctl_ipi_storm(void __user *p) {
+   return 0;
+ }
+ 
++static __always_inline struct kvm_tdx *to_kvm_tdx(struct kvm *kvm)
++{
++	return container_of(kvm, struct kvm_tdx, kvm);
++}
++
++int ioctl_req_outside_guest_mode(void __user *p) {
++  struct list_head* i;
++  struct kvm* kvm = NULL;
++  struct kvm_tdx *kvm_tdx = NULL;
++
++  list_for_each(i, _vm_list) {
++    kvm = list_entry(i, struct kvm, vm_list);
++
++    if (atomic_read(&kvm->online_vcpus) == 0) {
++      printk(KERN_INFO
++      "no vcpus are online %d\n", atomic_read(&kvm->online_vcpus));
++      return -1;
++    }
++    }
++  if (!kvm)
++  {
++    pr_info("kvm object not found\n");
++    return -1;
++  }
++
++  kvm_tdx = to_kvm_tdx(kvm);
++
++
++  printk(KERN_INFO "KVM STRUCT  %p\n", kvm_tdx);
++  printk(KERN_INFO "TDX TDR PAGE PA %lx\n", kvm_tdx->tdr_pa);
++	
++  printk(KERN_INFO "Issuing kvm_make_all_cpus_request call\n");  
++  _kvm_make_all_cpus_request(kvm, KVM_REQ_OUTSIDE_GUEST_MODE);
++
++  return 0;
++}
++
++typedef struct {
++  unsigned long tdr_pa;
++  int pid;
++} gateway_get_tdr_pa_data_t;
++
++int ioctl_get_tdr_pa(void __user *p) {
++  gateway_get_tdr_pa_data_t data;
++
++  struct list_head* i;
++  struct kvm* kvm = NULL;
++  struct kvm_tdx *kvm_tdx = NULL;
++  int found_kvm = 0;
++
++  if (copy_from_user(&data, p, sizeof(data))) {
++    printk(KERN_ALERT "copy_to_user failed\n");
++    return -EFAULT;
++  }
++
++  list_for_each(i, _vm_list) {
++    kvm = list_entry(i, struct kvm, vm_list);
++
++    if (kvm->userspace_pid == data.pid) {
++      if (atomic_read(&kvm->online_vcpus) == 0) {
++        printk(KERN_INFO
++        "no vcpus are online %d\n", atomic_read(&kvm->online_vcpus));
++        return -1;
++      }
++      found_kvm = 1;
++      break;
++    }
++  }
++  if (!found_kvm)
++  {
++    pr_info("kvm object not found\n");
++    return -1;
++  }
++
++  kvm_tdx = to_kvm_tdx(kvm);
++
++  printk(KERN_INFO "TDX TDR PAGE PA %lx\n", kvm_tdx->tdr_pa);
++
++  data.tdr_pa = kvm_tdx->tdr_pa;
++
++  if (copy_to_user(p, &data, sizeof(data))) {
++    printk(KERN_ALERT "copy_to_user failed\n");
++    return -EFAULT;
++  }
++
++  return 0;
++}
++
++typedef struct {
++  unsigned long tdcs_pa;
++  int pid;
++} gateway_get_tdcs_pa_data_t;
++int ioctl_get_tdcs_pa(void __user *p) {
++  gateway_get_tdcs_pa_data_t data;
++
++  struct list_head* i;
++  struct kvm* kvm = NULL;
++  struct kvm_tdx *kvm_tdx = NULL;
++  int found_kvm = 0;
++
++  if (copy_from_user(&data, p, sizeof(data))) {
++    printk(KERN_ALERT "copy_to_user failed\n");
++    return -EFAULT;
++  }
++
++  list_for_each(i, _vm_list) {
++    kvm = list_entry(i, struct kvm, vm_list);
++
++    if (kvm->userspace_pid == data.pid) {
++      if (atomic_read(&kvm->online_vcpus) == 0) {
++        printk(KERN_INFO
++        "no vcpus are online %d\n", atomic_read(&kvm->online_vcpus));
++        return -1;
++      }
++      found_kvm = 1;
++      break;
++    }
++  }
++  if (!found_kvm)
++  {
++    pr_info("kvm object not found\n");
++    return -1;
++  }
++
++  kvm_tdx = to_kvm_tdx(kvm);
++
++  printk(KERN_INFO "TDX TDR PAGE PA %lx\n", kvm_tdx->tdcs_pa[0]);
++  printk(KERN_INFO "HKID 0x%x\n", kvm_tdx->hkid);
++
++  data.tdcs_pa = kvm_tdx->tdcs_pa[0];
++
++  if (copy_to_user(p, &data, sizeof(data))) {
++    printk(KERN_ALERT "copy_to_user failed\n");
++    return -EFAULT;
++  }
++
++  return 0;
++}
+ 
+diff --git a/pocs/cpus/tdxplore/kmod/ioctl.h b/pocs/cpus/tdxplore/kmod/ioctl.h
+index 25f34b0..8104f9d 100644
+--- a/pocs/cpus/tdxplore/kmod/ioctl.h
++++ b/pocs/cpus/tdxplore/kmod/ioctl.h
+@@ -3,6 +3,7 @@
+ 
+ #include <linux/uaccess.h>
+ #include <linux/version.h>
++#include <linux/kvm_host.h>
+ 
+ #include "config.h"
+ 
+@@ -49,17 +50,25 @@ int ioctl_issue_vmptrst(void __user *p);
+ int ioctl_reschedule(void __user *p);
+ int ioctl_ipi_storm(void __user *p);
+ 
++int ioctl_req_outside_guest_mode(void __user *p);
++
++int ioctl_get_tdr_pa(void __user *p);
++int ioctl_get_tdcs_pa(void __user *p);
++
+ typedef struct task_struct *(*find_task_by_vpid_function_t)(pid_t vpid);
+ typedef struct file *(*task_lookup_fdget_rcu_function_t)(struct task_struct *task,
+                                                       unsigned int fd);
++typedef bool (*kvm_make_all_cpus_request_t)(struct kvm* kvm, unsigned int req);
+ 
+ typedef unsigned long (*kallsyms_lookup_name_function_t)(const char *name);
+ 
+ extern find_task_by_vpid_function_t _find_task_by_vpid;
+ extern task_lookup_fdget_rcu_function_t _task_lookup_fdget_rcu;
+ extern kallsyms_lookup_name_function_t _kallsyms_lookup_name;
++extern struct list_head* _vm_list;
++extern kvm_make_all_cpus_request_t _kvm_make_all_cpus_request;
+ 
+ int ioctl_fdget(void __user *p);
+ int ioctl_fdput(void __user *p);
+ 
+-#endif  // __GATEWAY_IOCTL_H__
+\ No newline at end of file
++#endif  // __GATEWAY_IOCTL_H__
+diff --git a/pocs/cpus/tdxplore/lib/build.sh b/pocs/cpus/tdxplore/lib/build.sh
+old mode 100644
+new mode 100755
+diff --git a/pocs/cpus/tdxplore/lib/gateway.c b/pocs/cpus/tdxplore/lib/gateway.c
+index 904ad5d..7a57b9f 100644
+--- a/pocs/cpus/tdxplore/lib/gateway.c
++++ b/pocs/cpus/tdxplore/lib/gateway.c
+@@ -48,6 +48,11 @@
+ 
+ #define GATEWAY_IOCTL_IPI_STORM _IOWR(GATEWAY_IOC_MAGIC, 32, void *)
+ 
++#define GATEWAY_IOCTL_REQ_OUTSIDE_GUEST_MODE _IOWR(GATEWAY_IOC_MAGIC, 33, void *)
++
++#define GATEWAY_IOCTL_GET_TDR_PA _IOWR(GATEWAY_IOC_MAGIC, 34, void *)
++#define GATEWAY_IOCTL_GET_TDCS_PA _IOWR(GATEWAY_IOC_MAGIC, 35, void *)
++
+ int gateway_open(char *path) {
+   // printf("gateway_open\n");
+ 
+@@ -860,6 +865,63 @@ int gateway_ipi_storm(int fd, uint32_t cpu, uint32_t count, uint32_t delay) {
+   return 0;
+ }
+ 
++int gateway_req_outside_guest_mode(int fd) {
++  int status;
++  status = ioctl(fd, GATEWAY_IOCTL_REQ_OUTSIDE_GUEST_MODE, NULL);
++  
++  if (status != 0) {
++    printf("[-] gateway_req_outside_guest_mode failed\n");
++    return status;
++  }
++
++  return 0;
++}
++
++typedef struct {
++  unsigned long tdr_pa;
++  int pid;
++} gateway_get_tdr_pa_data_t;
++
++int gateway_get_tdr_pa(int fd, int pid, phys_addr_t *pa) {
++  gateway_get_tdr_pa_data_t data;
++  int status;
++
++  data.pid = pid;
++
++  status = ioctl(fd, GATEWAY_IOCTL_GET_TDR_PA, &data);
++
++  if (status != 0) {
++    printf("[-] gateway_get_tdr_pa failed\n");
++    return status;
++  }
++
++  *pa = data.tdr_pa;
++
++  return 0;
++}
++
++typedef struct {
++  unsigned long tdcs_pa;
++  int pid;
++} gateway_get_tdcs_pa_data_t;
++int gateway_get_tdcs_pa(int fd, int pid, phys_addr_t *pa) {
++  gateway_get_tdcs_pa_data_t data;
++  int status;
++
++  data.pid = pid;
++
++  status = ioctl(fd, GATEWAY_IOCTL_GET_TDCS_PA, &data);
++
++  if (status != 0) {
++    printf("[-] gateway_get_tdcs_pa failed\n");
++    return status;
++  }
++
++  *pa = data.tdcs_pa;
++
++  return 0;
++}
++
+ int gateway_set_thread_affinity(pthread_t thread, uint32_t core) {
+   cpu_set_t cpuset;
+   int status;
+diff --git a/pocs/cpus/tdxplore/lib/gateway.h b/pocs/cpus/tdxplore/lib/gateway.h
+index eb335ea..a9781ed 100644
+--- a/pocs/cpus/tdxplore/lib/gateway.h
++++ b/pocs/cpus/tdxplore/lib/gateway.h
+@@ -94,6 +94,11 @@ int gateway_reschedule(int fd, uint32_t cpu, uint32_t count, uint32_t delay);
+ 
+ int gateway_ipi_storm(int fd, uint32_t cpu, uint32_t count, uint32_t delay);
+ 
++int gateway_req_outside_guest_mode(int fd);
++int gateway_get_tdr_pa(int fd, int pid, phys_addr_t *pa);
++int gateway_get_tdcs_pa(int fd, int pid, phys_addr_t *pa);
++
++
+ int gateway_set_thread_affinity(pthread_t thread, uint32_t core);
+ int gateway_set_process_priority(int policy, int priority);
+ 
+diff --git a/pocs/cpus/tdxplore/py/gateway.py b/pocs/cpus/tdxplore/py/gateway.py
+index c196749..4ba4702 100644
+--- a/pocs/cpus/tdxplore/py/gateway.py
++++ b/pocs/cpus/tdxplore/py/gateway.py
+@@ -543,6 +543,25 @@ class Gateway:
+       ]
+       lib.gateway_ipi_flood.restype = ctypes.c_int
+ 
++    lib.gateway_req_outside_guest_mode.argtypes = [
++        ctypes.c_int,
++    ]
++    lib.gateway_req_outside_guest_mode.restype = ctypes.c_int
++
++    lib.gateway_get_tdr_pa.argtypes = [
++        ctypes.c_int,
++        ctypes.c_int,
++        ctypes.POINTER(ctypes.c_uint64),
++    ]
++    lib.gateway_get_tdr_pa.restype = ctypes.c_int
++
++    lib.gateway_get_tdcs_pa.argtypes = [
++        ctypes.c_int,
++        ctypes.c_int,
++        ctypes.POINTER(ctypes.c_uint64),
++    ]
++    lib.gateway_get_tdcs_pa.restype = ctypes.c_int
++
+   def mmap(self, address: int, size: int) -> ctypes.c_void_p:
+     """Maps a physical address range into the process's virtual address space.
+ 
+@@ -986,6 +1005,7 @@ class Gateway:
+         ctypes.c_uint64(r12),
+         ctypes.c_uint64(r13),
+     ]
++
+     ret = Gateway._lib.gateway_issue_seamcall(
+         self._device_fd, *[ctypes.byref(r) for r in regs]
+     )
+@@ -1084,6 +1104,30 @@ class Gateway:
+           f" code {ret}."
+       )
+ 
++  def req_outside_guest_mode(self) -> None:
++    ret = Gateway._lib.gateway_req_outside_guest_mode(self._device_fd)
++    if ret != 0:
++      raise GatewayError(
++          f"req_outside_guest_mode failed for fd {self._device_fd} with error code {ret}."
++      )
++
++  def get_tdr_pa(self, pid) -> None:
++    value = ctypes.c_uint64()
++    ret = Gateway._lib.gateway_get_tdr_pa(self._device_fd, pid, ctypes.byref(value))
++    if ret != 0:
++      raise GatewayError(
++          f"get_tdr_pa failed for fd {self._device_fd} with error code {ret}."
++      )
++    return value.value
++  
++  def get_tdcs_pa(self, pid) -> None:
++    value = ctypes.c_uint64()
++    ret = Gateway._lib.gateway_get_tdcs_pa(self._device_fd, pid, ctypes.byref(value))
++    if ret != 0:
++      raise GatewayError(
++          f"get_tdcs_pa failed for fd {self._device_fd} with error code {ret}."
++      )
++    return value.value
+ 
+ from argparse import ArgumentParser
+ 
+diff --git a/pocs/cpus/tdxplore/py/tdxtend.py b/pocs/cpus/tdxplore/py/tdxtend.py
+index 8f28987..e073891 100644
+--- a/pocs/cpus/tdxplore/py/tdxtend.py
++++ b/pocs/cpus/tdxplore/py/tdxtend.py
+@@ -345,7 +345,7 @@ class SeamCallLeafOpcode(Enum):
+   TDH_MEM_PAGE_ADD_LEAF = 2
+   TDH_MEM_SEPT_ADD_LEAF = 3
+   TDH_VP_ADDCX_LEAF = 4
+-  TDH_MEM_PAGE_RELOCATE = 5
++  TDH_MEM_PAGE_RELOCATE_LEAF = 5
+   TDH_MEM_PAGE_AUG_LEAF = 6
+   TDH_MEM_RANGE_BLOCK_LEAF = 7
+   TDH_MNG_KEY_CONFIG_LEAF = 8
+@@ -651,11 +651,11 @@ class Tdxtend:
+     if pid == INVALID_PID:
+       return
+ 
+-    self.release = release()
+-    if release() not in versions:
++    self.release = "6.8.12+" #release()
++    if self.release not in versions:
+       raise ValueError(f"Unsupported kernel version: {release()}")
+ 
+-    self.version = versions[release()]
++    self.version = versions[self.release]
+ 
+     boxy = Boxy("struct_kvm", endian=Endian.LITTLE)
+     boxy.addfield(
+@@ -1431,12 +1431,50 @@ class Tdxtend:
+ 
+     return rax
+ 
++  def call_tdh_mem_sept_add(
++      self, tdr_pa: int, gpa: int, level: int, target_hpa: int, allow_existing: bool
++  ) -> [int, int, int, int]:
++    """Read a Secure EPT entry."""
++
++    (rax, rcx, rdx, r8, _, _, _, _, _) = self.gateway.issue_seamcall(
++        SeamCallLeafOpcode.TDH_MEM_SEPT_ADD_LEAF.value | (1 << 16),
++        (gpa | level),
++        (tdr_pa | allow_existing),
++        target_hpa,
++        -1,
++        -1,
++        -1,
++        0,
++        0,
++    )
++
++    return rax, rcx, rdx, r8
++
++  def call_tdh_mem_rd(
++      self, tdr_pa: int, gpa: int
++  ) -> [int, int, int, int]:
++    """Read a Secure EPT entry."""
++
++    (rax, rcx, rdx, r8, _, _, _, _, _) = self.gateway.issue_seamcall(
++        SeamCallLeafOpcode.TDH_MEM_RD_LEAF.value,
++        gpa,
++        tdr_pa,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++    )
++
++    return rax, rcx, rdx, r8
++
+   def call_tdh_mem_sept_rd(
+       self, tdr_pa: int, gpa: int, level: int
+   ) -> [int, int]:
+     """Read a Secure EPT entry."""
+ 
+-    (rax, rcx, _, _, _, _, _, _, _) = self.gateway.issue_seamcall(
++    (rax, rcx, rdx, r8, _, _, _, _, _) = self.gateway.issue_seamcall(
+         SeamCallLeafOpcode.TDH_MEM_SEPT_RD_LEAF.value,
+         (gpa | level),
+         tdr_pa,
+@@ -1448,7 +1486,82 @@ class Tdxtend:
+         0,
+     )
+ 
+-    return rax, rcx
++    return rax, rcx, rdx, r8
++
++  def call_tdh_mem_range_block(
++      self, tdr_pa: int, gpa: int, level: int
++  ) -> [int, int]:
++    """Block a TD private GPA range at any level from creating new GPA-to-HPA address translations."""
++
++    (rax, rcx, rdx, _, _, _, _, _, _) = self.gateway.issue_seamcall(
++        SeamCallLeafOpcode.TDH_MEM_RANGE_BLOCK_LEAF.value,
++        (gpa | level),
++        tdr_pa,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++    )
++
++    return rax, rcx, rdx
++  
++  def call_tdh_mem_range_unblock(
++      self, tdr_pa: int, gpa: int, level: int
++  ) -> [int, int]:
++    """Remove the blocking of a TD private GPA range, at any level previously blocked by TDH.MEM.RANGE.BLOCK."""
++
++    (rax, rcx, rdx, _, _, _, _, _, _) = self.gateway.issue_seamcall(
++        SeamCallLeafOpcode.TDH_MEM_RANGE_UNBLOCK_LEAF.value,
++        (gpa | level),
++        tdr_pa,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++    )
++
++    return rax, rcx, rdx
++
++  def call_tdh_mem_track(
++      self, tdr_pa: int
++  ) -> [int, int]:
++    """Increment the TD's TLB epoch counter."""
++    (rax, _, _, _, _, _, _, _, _) = self.gateway.issue_seamcall(
++        SeamCallLeafOpcode.TDH_MEM_TRACK_LEAF.value,
++        tdr_pa,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++    )
++
++    return rax
++
++  def call_tdh_mem_page_relocate(
++          self, tdr_pa: int, gpa: int, level: int, target_hpa: int
++  ) -> [int, int]:
++    """Relocate a 4KB mapped page from its current host physical address to another."""
++
++    (rax, rcx, rdx, _, _, _, _, _, _) = self.gateway.issue_seamcall(
++        SeamCallLeafOpcode.TDH_MEM_PAGE_RELOCATE_LEAF.value,
++        (gpa | level),
++        tdr_pa,
++        target_hpa,
++        0,
++        0,
++        0,
++        0,
++        0,
++    )
++
++    return rax, rcx, rdx
+ 
+   def switch_to_associated_tdvpr_cpu(self, tdvpr: int) -> int:
+     """Finds the CPU associated with the given TDVPR PA."""

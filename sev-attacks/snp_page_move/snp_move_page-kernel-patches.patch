@@ -1,0 +1,172 @@
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index b4b6860ab971..b5797a896ea2 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -309,6 +309,8 @@ static inline bool kvm_has_mirrored_tdp(const struct kvm *kvm)
+ 	return kvm->arch.vm_type == KVM_X86_TDX_VM;
+ }
+ 
++int kvm_update_spte(struct kvm *kvm, gfn_t gfn, hpa_t new_hpa);
++
+ static inline gfn_t kvm_gfn_direct_bits(const struct kvm *kvm)
+ {
+ 	return kvm->arch.gfn_direct_bits;
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 4e06e2e89a8f..efadbdd39f61 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4382,6 +4382,23 @@ static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu,
+ 	return false;
+ }
+ 
++/**
++ * Update the SPTE for the given GFN to the new HPA.
++ */
++int kvm_update_spte(struct kvm *kvm, gfn_t gfn, hpa_t new_hpa)
++{
++	int ret = 0;
++
++	read_lock(&kvm->mmu_lock);
++
++	ret = kvm_tdp_mmu_update_spte(kvm, gfn, new_hpa);
++
++	read_unlock(&kvm->mmu_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(kvm_update_spte);
++
+ static void shadow_page_table_clear_flood(struct kvm_vcpu *vcpu, gva_t addr)
+ {
+ 	struct kvm_shadow_walk_iterator iterator;
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 7f3d7229b2c1..6b748c2ef613 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -803,6 +803,9 @@ static inline bool __must_check tdp_mmu_iter_need_resched(struct kvm *kvm,
+ 	return iter->next_last_level_gfn != iter->yielded_gfn;
+ }
+ 
++#define tdp_mmu_for_each_pte(_iter, _kvm, _mmu, _start, _end)		\
++	for_each_tdp_pte(_iter, _kvm, to_shadow_page(_mmu->root.hpa), _start, _end)
++
+ /*
+  * Yield if the MMU lock is contended or this thread needs to return control
+  * to the scheduler.
+@@ -1904,6 +1907,44 @@ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+ 	return spte_set;
+ }
+ 
++/**
++ * Update the SPTE for the given GFN to the new HPA.
++ */
++int kvm_tdp_mmu_update_spte(struct kvm *kvm, gfn_t gfn, hpa_t new_hpa)
++{
++	struct tdp_iter iter;
++	struct kvm_mmu_page *root;
++	u64 new_spte;
++	int ret = -EFAULT;
++
++	for_each_valid_tdp_mmu_root_yield_safe(kvm, root, 0) {
++		for_each_tdp_pte_min_level(iter, kvm, root, PG_LEVEL_4K, gfn, gfn+1) {
++retry:
++			if (!is_shadow_present_pte(iter.old_spte) || !is_last_spte(iter.old_spte, iter.level))
++				continue;
++
++			new_spte = (iter.old_spte & ~SPTE_BASE_ADDR_MASK) | (new_hpa & SPTE_BASE_ADDR_MASK);
++
++			// We first have to invalidate the SPTE
++			if (tdp_mmu_set_spte_atomic(kvm, &iter, SHADOW_NONPRESENT_VALUE))
++				goto retry;
++
++			kvm_flush_remote_tlbs(kvm);
++
++			// Write the new SPTE
++			while (tdp_mmu_set_spte_atomic(kvm, &iter, new_spte) == -EBUSY)
++        cpu_relax();
++
++			kvm_flush_remote_tlbs(kvm);
++
++			ret = 0;
++			break;
++		}
++	}
++
++	return ret;
++}
++
+ /*
+  * Return the level of the lowest level SPTE added to sptes.
+  * That SPTE may be non-present.
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index 52acf99d40a0..ad14459cc677 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -88,6 +88,8 @@ void kvm_tdp_mmu_clear_dirty_pt_masked(struct kvm *kvm,
+ void kvm_tdp_mmu_recover_huge_pages(struct kvm *kvm,
+ 				    const struct kvm_memory_slot *slot);
+ 
++int kvm_tdp_mmu_update_spte(struct kvm *kvm, gfn_t gfn, hpa_t new_hpa);
++
+ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+ 				   struct kvm_memory_slot *slot, gfn_t gfn,
+ 				   int min_level);
+diff --git a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c
+index b66244d6b10f..7dd2e2f23e0d 100644
+--- a/drivers/crypto/ccp/sev-dev.c
++++ b/drivers/crypto/ccp/sev-dev.c
+@@ -229,6 +229,7 @@ static int sev_cmd_buffer_len(int cmd)
+ 	case SEV_CMD_SNP_DBG_DECRYPT:		return sizeof(struct sev_data_snp_dbg);
+ 	case SEV_CMD_SNP_DBG_ENCRYPT:		return sizeof(struct sev_data_snp_dbg);
+ 	case SEV_CMD_SNP_PAGE_UNSMASH:		return sizeof(struct sev_data_snp_page_unsmash);
++	case SEV_CMD_SNP_PAGE_MOVE:		return sizeof(struct sev_data_snp_page_move);
+ 	case SEV_CMD_SNP_PLATFORM_STATUS:	return sizeof(struct sev_data_snp_addr);
+ 	case SEV_CMD_SNP_GUEST_REQUEST:		return sizeof(struct sev_data_snp_guest_request);
+ 	case SEV_CMD_SNP_CONFIG:		return sizeof(struct sev_user_data_snp_config);
+@@ -1162,6 +1163,18 @@ static int snp_filter_reserved_mem_regions(struct resource *rs, void *arg)
+ 	struct sev_data_range *range = &range_list->ranges[range_list->num_elements];
+ 	size_t size;
+ 
++	/*
++	 * Skip the memory connected to socket 1.
++	 * We want this memory range to stay in the "Hypervisor" state so we can RMPUPDATE
++	 * later. By default, the driver will lock these pages as "HV-fixed".
++	 * 
++	 * Note: These physical addresses depend on the system configuration.
++	 */
++	if (rs->start >= 0x1000000000 && rs->end < 0x2050000000) {
++		pr_info("snp_filter_reserved_mem_regions: Skipping HV-fixed protection for range %llx-%llx\n", (u64)rs->start, (u64)rs->end);
++		return 0;
++	}
++
+ 	/*
+ 	 * Ensure the list of HV_FIXED pages that will be passed to firmware
+ 	 * do not exceed the page-sized argument buffer.
+diff --git a/include/linux/psp-sev.h b/include/linux/psp-sev.h
+index 1b4c68ec5c65..8ba1ade3a41d 100644
+--- a/include/linux/psp-sev.h
++++ b/include/linux/psp-sev.h
+@@ -742,6 +742,23 @@ struct sev_data_snp_page_unsmash {
+ 	u64 paddr;
+ } __packed;
+ 
++/**
++ * struct sev_data_snp_page_move - SNP_PAGE_MOVE command params
++ *
++ * @gctx_paddr: system physical address of guest context page
++ * @page_size: page size 0 indicates 4K and 1 indicates 2MB page
++ * @rsvd: reserved
++ * @src_paddr: system physical address of the source page
++ * @dst_paddr: system physical address of the destination page
++ */
++struct sev_data_snp_page_move {
++	u64 gctx_paddr;
++	u32 page_size;
++	u32 rsvd;
++	u64 src_paddr;
++	u64 dst_paddr;
++} __packed;
++
+ /**
+  * struct sev_data_snp_dbg - DBG_ENCRYPT/DBG_DECRYPT command parameters
+  *

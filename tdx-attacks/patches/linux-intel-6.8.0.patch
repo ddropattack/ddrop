@@ -1,0 +1,36 @@
+--- base-linux-intel-6.8.0/arch/x86/virt/vmx/tdx/tdx.c	2025-12-17 13:26:59.501277946 +0000
++++ linux-intel-6.8.0/arch/x86/virt/vmx/tdx/tdx.c	2026-02-19 16:31:16.497649995 +0000
+@@ -311,6 +313,20 @@ static int build_tdx_memlist(struct list
+ 			goto err;
+ 	}
+ 
++	/*
++	 * for_each_mem_pfn_range won't iterate over reserved memory ranges.
++	 * Assuming we set up the system with the entire second socket's memory
++	 * reserved, we have to manually add this region as TDX memory to set up
++	 * a TDMR on this socket.
++	 * We set the node ID to zero, this is only used to determine where to
++	 * allocate the PAMT. Setting it to zero forces the PAMT on socket 0.
++	 * Note: These PFNs are hardcoded, these are machine/memory configuration
++	 *       dependant.
++	 */
++	ret = add_tdx_memblock(tmb_list, 0x3000000, 0x3800000, 0);
++	if (ret)
++		goto err;
++
+ 	return 0;
+ err:
+ 	free_tdx_memlist(tmb_list);
+--- base-linux-intel-6.8.0/virt/kvm/guest_memfd.c	2025-12-17 13:35:10.117070164 +0000
++++ linux-intel-6.8.0/virt/kvm/guest_memfd.c	2026-02-19 16:34:02.202856737 +0000
+@@ -422,6 +422,10 @@ int kvm_gmem_create(struct kvm *kvm, str
+ 	u64 flags = args->flags;
+ 	u64 valid_flags = 0;
+ 
++	// TDH.MEM.PAGE.RELOCATE only works with 4kB pages
++	if (flags & KVM_GUEST_MEMFD_ALLOW_HUGEPAGE)
++		flags &= ~KVM_GUEST_MEMFD_ALLOW_HUGEPAGE;
++
+ 	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+ 		valid_flags |= KVM_GUEST_MEMFD_ALLOW_HUGEPAGE;
+ 
